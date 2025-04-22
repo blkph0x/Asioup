@@ -1,6 +1,3 @@
-Here's a comprehensive GitHub-style `README.md` whitepaper in Markdown format for your AsUpIO.sys privilege escalation exploit:
-
----
 
 ```markdown
 # AsUpIO.sys Privilege Escalation Exploit
